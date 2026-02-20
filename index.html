@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGPU DDGI + Radiance Cascades Prototype</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>WebGPU DDGI + Radiance Cascades Prototype</h1>
+      <p>
+        A compact global illumination experiment that combines probe-based indirect lighting with two
+        cascaded radiance volumes.
+      </p>
+      <canvas id="gpu-canvas"></canvas>
+      <section id="legend">
+        <div><span class="chip direct"></span>Direct + emissive</div>
+        <div><span class="chip indirect"></span>Probe-based indirect bounce</div>
+        <div><span class="chip cascade"></span>Cascade blend (coarse + fine)</div>
+      </section>
+      <p id="status"></p>
+    </main>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
