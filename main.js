@@ -45,6 +45,60 @@ fn emissiveLight(p: vec3f) -> vec3f {
   return c0 + c1;
 }
 
+struct HeightFog {
+  color : vec3f,
+  density : f32,
+  height : f32,
+  falloff : f32,
+};
+
+struct VolumeSphere {
+  center : vec3f,
+  density : f32,
+  color : vec3f,
+  radius : f32,
+};
+
+fn heightFog() -> HeightFog {
+  return HeightFog(vec3f(0.58, 0.67, 0.86), 0.09, 0.65, 1.85);
+}
+
+fn volumeSphere(index: u32) -> VolumeSphere {
+  if (index == 0u) {
+    return VolumeSphere(vec3f(-0.2, 0.9, 0.1), 0.46, vec3f(0.95, 0.45, 0.25), 0.62);
+  }
+  return VolumeSphere(vec3f(1.55, 0.68, 1.2), 0.35, vec3f(0.22, 0.45, 1.0), 0.55);
+}
+
+fn volumeMedium(p: vec3f) -> vec4f {
+  let fog = heightFog();
+  let fogDensity = fog.density * exp(-max(p.y - fog.height, 0.0) * fog.falloff);
+  var density = fogDensity;
+  var albedo = fog.color * fogDensity;
+
+  for (var i = 0u; i < 2u; i = i + 1u) {
+    let v = volumeSphere(i);
+    let distN = length(p - v.center) / v.radius;
+    let inside = max(1.0 - distN, 0.0);
+    let localDensity = v.density * inside * inside;
+    density += localDensity;
+    albedo += v.color * localDensity;
+  }
+
+  if (density > 0.00001) {
+    albedo /= density;
+  } else {
+    albedo = fog.color;
+  }
+
+  let extinction = density * 1.2;
+  return vec4f(albedo, extinction);
+}
+
+fn volumeTransmittance(extinction: f32, distance: f32) -> f32 {
+  return exp(-extinction * max(distance, 0.0));
+}
+
 fn sceneIntersect(ro: vec3f, rd: vec3f) -> vec4f {
   var hitT = 1e9;
   var normal = vec3f(0.0);
@@ -211,6 +265,159 @@ fn csMain(@builtin(global_invocation_id) gid : vec3u) {
 }
 `;
 
+
+const VOLUMETRIC_PROBE_SHADER = /* wgsl */ `
+${COMMON_WGSL}
+
+@group(0) @binding(1) var coarseIn : texture_2d<f32>;
+@group(0) @binding(2) var fineIn : texture_2d<f32>;
+@group(0) @binding(3) var volumeProbeOut : texture_storage_2d<rgba16float, write>;
+
+struct VolumeProbeParams {
+  size : u32,
+  spacing : f32,
+  raysPerSample : u32,
+  samplesPerProbe : u32,
+};
+
+@group(0) @binding(4) var<uniform> volumeProbeParams : VolumeProbeParams;
+
+fn sampleProbe(tex: texture_2d<f32>, p: vec3f) -> vec3f {
+  let d = vec2f(textureDimensions(tex));
+  let uv = clamp(p.xz / 8.0 + 0.5, vec2f(0.0), vec2f(0.999));
+  let c = vec2i(uv * d);
+  return textureLoad(tex, c, 0).rgb;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn csMain(@builtin(global_invocation_id) gid : vec3u) {
+  if (gid.x >= volumeProbeParams.size || gid.y >= volumeProbeParams.size) {
+    return;
+  }
+
+  let coord = vec2u(gid.xy);
+  let dim = f32(volumeProbeParams.size);
+  let uv = (vec2f(coord) + 0.5) / dim;
+  let worldXZ = (uv - 0.5) * (volumeProbeParams.spacing * dim * 0.7);
+  let probePos = vec3f(worldXZ.x, 1.0, worldXZ.y);
+
+  var accum = vec3f(0.0);
+  for (var s = 0u; s < volumeProbeParams.samplesPerProbe; s = s + 1u) {
+    let a = (f32(s) + 0.5) / f32(volumeProbeParams.samplesPerProbe);
+    let phi = 6.2831853 * fract(a + hash12(uv + vec2f(f32(s), 0.0)));
+    let z = mix(-0.35, 0.95, fract(a * 1.731));
+    let dir = normalize(vec3f(cos(phi) * sqrt(max(1.0 - z * z, 0.0)), z, sin(phi) * sqrt(max(1.0 - z * z, 0.0))));
+    let primaryHit = sceneIntersect(probePos, dir);
+    let maxDist = select(7.0, primaryHit.w, primaryHit.w > 0.0);
+
+    var local = vec3f(0.0);
+    let dt = maxDist / f32(volumeProbeParams.raysPerSample + 1u);
+    for (var i = 0u; i < volumeProbeParams.raysPerSample; i = i + 1u) {
+      let t = (f32(i) + 0.35 + hash12(vec2f(f32(i), uv.x + uv.y)) * 0.3) * dt;
+      let p = probePos + dir * t;
+      let medium = volumeMedium(p);
+      if (medium.w < 0.0001) {
+        continue;
+      }
+
+      let rayPhi = 6.2831853 * hash12(vec2f(f32(i) * 2.0 + 0.37, f32(s) + uv.y));
+      let rayZ = mix(-0.85, 0.95, hash12(vec2f(f32(i) + uv.x, f32(s) + 0.17)));
+      let rayDir = normalize(vec3f(cos(rayPhi) * sqrt(max(1.0 - rayZ * rayZ, 0.0)), rayZ, sin(rayPhi) * sqrt(max(1.0 - rayZ * rayZ, 0.0))));
+
+      let hit = sceneIntersect(p, rayDir);
+      var incoming = vec3f(0.02, 0.03, 0.05);
+      if (hit.w > 0.0) {
+        let hp = p + rayDir * hit.w;
+        incoming += sceneAlbedo(hp) * emissiveLight(hp) * 0.14;
+      }
+      incoming += sampleProbe(fineIn, p) * 0.35 + sampleProbe(coarseIn, p) * 0.2;
+      local += incoming * medium.xyz * medium.w * dt;
+    }
+    accum += local / f32(max(volumeProbeParams.raysPerSample, 1u));
+  }
+
+  textureStore(volumeProbeOut, vec2i(coord), vec4f(accum / f32(max(volumeProbeParams.samplesPerProbe, 1u)), 1.0));
+}
+`;
+
+const VOLUMETRIC_GATHER_SHADER = /* wgsl */ `
+${COMMON_WGSL}
+
+@group(0) @binding(1) var albedoDepthTex : texture_2d<f32>;
+@group(0) @binding(2) var coarseProbes : texture_2d<f32>;
+@group(0) @binding(3) var fineProbes : texture_2d<f32>;
+@group(0) @binding(4) var volumeProbes : texture_2d<f32>;
+@group(0) @binding(5) var volumeOut : texture_storage_2d<rgba16float, write>;
+
+struct VolumetricParams {
+  screenSamples : u32,
+  raysPerSample : u32,
+  maxDistance : f32,
+  pad : f32,
+};
+
+@group(0) @binding(6) var<uniform> volumetricParams : VolumetricParams;
+
+fn sampleProbe(tex: texture_2d<f32>, p: vec3f) -> vec3f {
+  let d = vec2f(textureDimensions(tex));
+  let uv = clamp(p.xz / 8.0 + 0.5, vec2f(0.0), vec2f(0.999));
+  let c = vec2i(uv * d);
+  return textureLoad(tex, c, 0).rgb;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn csMain(@builtin(global_invocation_id) gid : vec3u) {
+  let dim = textureDimensions(volumeOut);
+  if (gid.x >= dim.x || gid.y >= dim.y) {
+    return;
+  }
+
+  let coord = vec2i(gid.xy);
+  let uv = (vec2f(gid.xy) + 0.5) / vec2f(dim);
+  let ro = camera.cameraPos.xyz;
+  let rd = worldRay(uv);
+  let ad = textureLoad(albedoDepthTex, coord, 0);
+  let targetDist = select(volumetricParams.maxDistance, ad.a, ad.a > 0.0);
+
+  var accum = vec3f(0.0);
+  let screenSampleCount = max(volumetricParams.screenSamples, 1u);
+  let raysPerSample = max(volumetricParams.raysPerSample, 1u);
+
+  for (var s = 0u; s < screenSampleCount; s = s + 1u) {
+    let jitter = hash12(vec2f(f32(s) + uv.x * 31.0, uv.y * 19.0));
+    let t = targetDist * ((f32(s) + jitter) / f32(screenSampleCount));
+    let p = ro + rd * t;
+    let medium = volumeMedium(p);
+
+    if (medium.w < 0.0001) {
+      continue;
+    }
+
+    var incoming = sampleProbe(volumeProbes, p) * 0.7 + sampleProbe(fineProbes, p) * 0.25 + sampleProbe(coarseProbes, p) * 0.15;
+    for (var r = 0u; r < raysPerSample; r = r + 1u) {
+      let phi = 6.2831853 * hash12(vec2f(f32(r) * 13.1 + f32(s), uv.x + uv.y));
+      let z = mix(-0.95, 0.95, hash12(vec2f(f32(r) + uv.y * 7.0, f32(s) + uv.x)));
+      let dir = normalize(vec3f(cos(phi) * sqrt(max(1.0 - z * z, 0.0)), z, sin(phi) * sqrt(max(1.0 - z * z, 0.0))));
+      let hit = sceneIntersect(p, dir);
+      if (hit.w > 0.0) {
+        let hp = p + dir * hit.w;
+        let tr = volumeTransmittance(medium.w, hit.w);
+        incoming += sceneAlbedo(hp) * emissiveLight(hp) * tr;
+      } else {
+        incoming += vec3f(0.02, 0.03, 0.06);
+      }
+    }
+
+    incoming /= f32(raysPerSample + 1u);
+    let stepLen = targetDist / f32(screenSampleCount);
+    let scatter = medium.xyz * medium.w * stepLen;
+    accum += incoming * scatter;
+  }
+
+  textureStore(volumeOut, coord, vec4f(accum, 1.0));
+}
+`;
+
 const LIGHTING_SHADER = /* wgsl */ `
 ${COMMON_WGSL}
 
@@ -218,6 +425,7 @@ ${COMMON_WGSL}
 @group(0) @binding(2) var normalHitTex : texture_2d<f32>;
 @group(0) @binding(3) var coarseProbes : texture_2d<f32>;
 @group(0) @binding(4) var fineProbes : texture_2d<f32>;
+@group(0) @binding(5) var volumetricBuffer : texture_2d<f32>;
 
 struct VSOut {
   @builtin(position) position : vec4f,
@@ -267,7 +475,8 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let depthBlend = smoothstep(1.2, 8.5, ad.a);
   let indirect = mix(fine, coarse, depthBlend) * ad.rgb * (0.45 + 0.55 * max(n.y, 0.0));
 
-  let color = ad.rgb * direct + indirect;
+  let volumetric = textureLoad(volumetricBuffer, coord, 0).rgb;
+  let color = ad.rgb * direct + indirect + volumetric;
   let mapped = color / (color + 1.0);
   return vec4f(pow(mapped, vec3f(0.4545)), 1.0);
 }
@@ -316,6 +525,16 @@ async function init() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  const volumeProbeParamsBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const volumetricParamsBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
   function createRenderTexture(label, formatTex) {
     return device.createTexture({
       label,
@@ -330,6 +549,17 @@ async function init() {
   let albedoDepthTex = createRenderTexture('gAlbedoDepth', 'rgba16float');
   let normalTex = createRenderTexture('gNormal', 'rgba16float');
 
+  function createVolumetricTexture() {
+    return device.createTexture({
+      label: 'volumetricLight',
+      size: [canvas.width, canvas.height],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+  }
+
+  let volumetricLightTex = createVolumetricTexture();
+
   const probeTextures = PROBE_CASCADES.map((cascade, i) =>
     device.createTexture({
       label: `probeCascade${i}`,
@@ -338,6 +568,13 @@ async function init() {
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     })
   );
+
+  const volumetricProbeTexture = device.createTexture({
+    label: 'volumetricProbeCascade',
+    size: [32, 32],
+    format: 'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  });
 
   const gbufferPipeline = device.createRenderPipeline({
     layout: 'auto',
@@ -357,6 +594,22 @@ async function init() {
     layout: 'auto',
     compute: {
       module: device.createShaderModule({ code: PROBE_SHADER }),
+      entryPoint: 'csMain',
+    },
+  });
+
+  const volumetricProbePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: VOLUMETRIC_PROBE_SHADER }),
+      entryPoint: 'csMain',
+    },
+  });
+
+  const volumetricGatherPipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: VOLUMETRIC_GATHER_SHADER }),
       entryPoint: 'csMain',
     },
   });
@@ -392,8 +645,10 @@ async function init() {
   function rebuildRenderTargets() {
     albedoDepthTex.destroy();
     normalTex.destroy();
+    volumetricLightTex.destroy();
     albedoDepthTex = createRenderTexture('gAlbedoDepth', 'rgba16float');
     normalTex = createRenderTexture('gNormal', 'rgba16float');
+    volumetricLightTex = createVolumetricTexture();
   }
 
   window.addEventListener('resize', () => {
@@ -413,6 +668,34 @@ async function init() {
         { binding: 1, resource: coarse.createView() },
         { binding: 2, resource: probeTextures[cascadeIndex].createView() },
         { binding: 3, resource: { buffer: probeParamsBuffer } },
+      ],
+    });
+  }
+
+  function createVolumetricProbeBindGroup() {
+    return device.createBindGroup({
+      layout: volumetricProbePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: cameraBuffer } },
+        { binding: 1, resource: probeTextures[0].createView() },
+        { binding: 2, resource: probeTextures[1].createView() },
+        { binding: 3, resource: volumetricProbeTexture.createView() },
+        { binding: 4, resource: { buffer: volumeProbeParamsBuffer } },
+      ],
+    });
+  }
+
+  function createVolumetricGatherBindGroup() {
+    return device.createBindGroup({
+      layout: volumetricGatherPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: cameraBuffer } },
+        { binding: 1, resource: albedoDepthTex.createView() },
+        { binding: 2, resource: probeTextures[0].createView() },
+        { binding: 3, resource: probeTextures[1].createView() },
+        { binding: 4, resource: volumetricProbeTexture.createView() },
+        { binding: 5, resource: volumetricLightTex.createView() },
+        { binding: 6, resource: { buffer: volumetricParamsBuffer } },
       ],
     });
   }
@@ -467,6 +750,25 @@ async function init() {
         pass.setBindGroup(0, probeBindGroups[i]);
         pass.dispatchWorkgroups(Math.ceil(cascade.size / 8), Math.ceil(cascade.size / 8));
       });
+
+      pass.setPipeline(volumetricProbePipeline);
+      device.queue.writeBuffer(
+        volumeProbeParamsBuffer,
+        0,
+        new Uint32Array([32, floatToUint(0.62), 8, 12])
+      );
+      pass.setBindGroup(0, createVolumetricProbeBindGroup());
+      pass.dispatchWorkgroups(4, 4);
+
+      pass.setPipeline(volumetricGatherPipeline);
+      device.queue.writeBuffer(
+        volumetricParamsBuffer,
+        0,
+        new Uint32Array([12, 8, floatToUint(12.0), 0])
+      );
+      pass.setBindGroup(0, createVolumetricGatherBindGroup());
+      pass.dispatchWorkgroups(Math.ceil(canvas.width / 8), Math.ceil(canvas.height / 8));
+
       pass.end();
     }
 
@@ -493,6 +795,7 @@ async function init() {
             { binding: 2, resource: normalTex.createView() },
             { binding: 3, resource: probeTextures[0].createView() },
             { binding: 4, resource: probeTextures[1].createView() },
+            { binding: 5, resource: volumetricLightTex.createView() },
           ],
         })
       );
@@ -505,7 +808,7 @@ async function init() {
   }
 
   requestAnimationFrame(draw);
-  statusEl.textContent = 'Running on WebGPU with 2 radiance cascades and dynamic DDGI probes.';
+  statusEl.textContent = 'Running on WebGPU with 2 radiance cascades, DDGI probes, and a volumetric final gather buffer.';
 
   if (device.lost) {
     device.lost.then((info) => {
